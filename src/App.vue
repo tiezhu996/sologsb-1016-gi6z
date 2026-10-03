@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   NAlert,
   NButton,
@@ -17,7 +17,9 @@ import {
   NTag
 } from 'naive-ui'
 import { useStudio } from './useStudio'
-import type { Cue, CueKind, Rate } from './types'
+import { makeDemoHandoff } from './handoff'
+import type { MergeSummary } from './useStudio'
+import type { Cue, CueKind, MergeConflict, Rate } from './types'
 
 const studio = useStudio()
 const {
@@ -28,6 +30,9 @@ const {
   pendingChanges,
   warnings,
   saveState,
+  mergeSession,
+  unresolvedConflicts,
+  mergeLocked,
   durationOfCue,
   durationOfScene,
   updateProject,
@@ -46,13 +51,26 @@ const {
   redo,
   freeze,
   downloadVersion,
-  resetSample
+  resetSample,
+  importHandoff,
+  resolveConflict,
+  abandonMerge
 } = studio
 
 const dragCueId = ref('')
 const showFreezeModal = ref(false)
 const freezeName = ref('')
 const activeRightTab = ref('warnings')
+const showImportModal = ref(false)
+const importError = ref('')
+const importInfo = ref('')
+const importSummary = ref<MergeSummary | null>(null)
+const importSummaryModalVisible = computed({
+  get: () => importSummary.value !== null,
+  set: (visible: boolean) => {
+    if (!visible) importSummary.value = null
+  }
+})
 
 const kindOptions = [
   { label: '台词', value: 'dialogue' },
@@ -91,6 +109,11 @@ const pendingCount = computed(() => pendingChanges.value.length)
 const warningCount = computed(() => warnings.value.length)
 const saveLabel = computed(() => saveState.value === 'saved' ? '已保存到本机' : '正在保存…')
 
+// 合并会话结束（全部选定或放弃）后，从「合并」页签切回检查页
+watch(mergeSession, (session) => {
+  if (!session && activeRightTab.value === 'merge') activeRightTab.value = 'warnings'
+})
+
 function cueName(cue: Cue) {
   if (cue.kind === 'dialogue') return state.value.document.characters.find((item) => item.id === cue.characterId)?.name ?? '未指定角色'
   if (cue.kind === 'sfx') return state.value.document.soundEffects.find((item) => item.id === cue.soundEffectId)?.name ?? '缺失音效'
@@ -120,6 +143,7 @@ function changeCueKind(cue: Cue, kind: CueKind) {
 }
 
 function openFreeze() {
+  if (mergeLocked.value) return
   freezeName.value = `制作稿 v${state.value.frozen.length + 1}`
   showFreezeModal.value = true
 }
@@ -127,7 +151,70 @@ function openFreeze() {
 function confirmFreeze() {
   const version = freeze(freezeName.value)
   showFreezeModal.value = false
-  downloadVersion(version)
+  if (version) downloadVersion(version)
+}
+
+function openImport() {
+  importError.value = ''
+  importInfo.value = ''
+  showImportModal.value = true
+}
+
+function runImport(raw: string) {
+  const result = importHandoff(raw)
+  if (!result.ok) {
+    if (result.reason === 'invalid') importError.value = result.message
+    else importInfo.value = result.message
+    return
+  }
+  showImportModal.value = false
+  importSummary.value = result.summary
+  if (result.summary.conflicts > 0) activeRightTab.value = 'merge'
+}
+
+function onPickFile(event: Event) {
+  importError.value = ''
+  importInfo.value = ''
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  file
+    .text()
+    .then(runImport)
+    .catch(() => {
+      importError.value = '读取文件失败，请重试。'
+    })
+    .finally(() => {
+      input.value = ''
+    })
+}
+
+function downloadDemoHandoff() {
+  const pkg = makeDemoHandoff(state.value.document)
+  const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `外采交接包-${pkg.importId}.json`
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
+function conflictValue(conflict: MergeConflict, side: 'local' | 'remote'): string {
+  const value = side === 'remote' ? conflict.remoteValue : conflict.localValue
+  if (conflict.field === 'deleted') {
+    if (value === undefined) return '（该侧已删除此条目）'
+    const entity = value as { code?: string; title?: string; text?: string; cues?: unknown[] }
+    if (conflict.entityType === 'scene') return `${entity.code ?? ''} ${entity.title ?? ''}（${entity.cues?.length ?? 0} 条提示）`
+    return `「${(entity.text ?? '').slice(0, 40)}」`
+  }
+  if (value === undefined || value === '') return '（空）'
+  if (conflict.field === 'rate') return `${value}×`
+  if (conflict.field === 'manualDuration' || conflict.field === 'durationLimit' || conflict.field === 'targetDuration' || conflict.field === 'duration') return `${value} 秒`
+  if (conflict.field === 'soundEffectId') return state.value.document.soundEffects.find((item) => item.id === value)?.name ?? String(value)
+  if (conflict.field === 'characterId') return state.value.document.characters.find((item) => item.id === value)?.name ?? String(value)
+  if (conflict.field === 'kind') return value === 'dialogue' ? '台词' : value === 'sfx' ? '音效' : '转场'
+  return String(value)
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -178,7 +265,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <span class="save-state">{{ saveLabel }}</span>
           <n-button quaternary @click="undo">撤销 ⌘Z</n-button>
           <n-button quaternary @click="redo">重做 ⇧⌘Z</n-button>
-          <n-button type="primary" @click="openFreeze">冻结并导出</n-button>
+          <n-button secondary @click="openImport">合并外采稿</n-button>
+          <n-button type="primary" :disabled="mergeLocked" :title="mergeLocked ? '存在未选定的合并冲突，选定前不能冻结' : ''" @click="openFreeze">冻结并导出</n-button>
         </div>
       </header>
 
@@ -345,9 +433,42 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               <span class="eyebrow">REVIEW DESK</span>
               <h2>导演确认区</h2>
             </div>
-            <n-button v-if="pendingCount" size="small" type="primary" secondary @click="acceptAll">全部接受</n-button>
+            <n-button v-if="pendingCount" size="small" type="primary" secondary :disabled="mergeLocked" @click="acceptAll">全部接受</n-button>
           </div>
+          <n-alert v-if="mergeLocked" type="warning" class="merge-lock" :show-icon="false">
+            有 {{ unresolvedConflicts.length }} 处合并冲突留下两版，导演选定前不能接受、冻结或导出。
+          </n-alert>
           <n-tabs v-model:value="activeRightTab" type="line" animated>
+            <n-tab-pane v-if="mergeSession" name="merge" :tab="`合并 ${unresolvedConflicts.length}`">
+              <div class="review-list">
+                <div class="merge-meta">
+                  <span>来自 {{ mergeSession.source }}</span>
+                  <span>{{ new Date(mergeSession.startedAt).toLocaleString('zh-CN') }}</span>
+                </div>
+                <div v-for="conflict in mergeSession.conflicts" :key="conflict.id" class="conflict-card" :class="{ resolved: !!conflict.resolution }">
+                  <div class="conflict-title">
+                    <strong>{{ conflict.label }}</strong>
+                    <n-tag v-if="conflict.resolution" size="small" type="success" :bordered="false">
+                      已选定{{ conflict.resolution === 'remote' ? '外采版' : '棚录版' }}
+                    </n-tag>
+                  </div>
+                  <div class="conflict-compare">
+                    <div class="conflict-side">
+                      <span class="side-label">棚录版 · 当前草稿</span>
+                      <p>{{ conflictValue(conflict, 'local') }}</p>
+                      <n-button size="small" secondary :disabled="!!conflict.resolution" @click="resolveConflict(conflict.id, 'local')">采用棚录版</n-button>
+                    </div>
+                    <div class="conflict-side remote">
+                      <span class="side-label">外采版 · 现场事实</span>
+                      <p>{{ conflictValue(conflict, 'remote') }}</p>
+                      <n-button size="small" type="primary" secondary :disabled="!!conflict.resolution" @click="resolveConflict(conflict.id, 'remote')">采用外采版</n-button>
+                    </div>
+                  </div>
+                </div>
+                <n-button block tertiary type="warning" @click="abandonMerge">放弃合并（草稿保留当前内容）</n-button>
+              </div>
+            </n-tab-pane>
+
             <n-tab-pane name="warnings" :tab="`检查 ${warningCount}`">
               <div class="review-list">
                 <div v-for="warning in warnings" :key="warning.id" class="warning-card" :class="warning.level">
@@ -372,9 +493,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                     <strong>{{ change.label }}</strong>
                     <span>{{ new Date(change.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
                   </div>
+                  <n-tag v-if="change.source" size="small" type="info" :bordered="false" class="source-tag">{{ change.source }}</n-tag>
                   <p v-if="change.note">{{ change.note }}</p>
                   <div class="pending-actions">
-                    <n-button size="small" type="primary" @click="acceptChange(change.id)">接受</n-button>
+                    <n-button size="small" type="primary" :disabled="mergeLocked" @click="acceptChange(change.id)">接受</n-button>
                     <n-button size="small" tertiary type="warning" @click="rejectChange(change.id)">退回</n-button>
                   </div>
                 </div>
@@ -390,7 +512,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                     <span>{{ new Date(version.createdAt).toLocaleString('zh-CN') }}</span>
                     <small>{{ version.document.scenes.length }} 场 · {{ version.totalDuration.toFixed(1) }} 秒</small>
                   </div>
-                  <n-button size="small" type="primary" secondary @click="downloadVersion(version)">导出稿</n-button>
+                  <n-button size="small" type="primary" secondary :disabled="mergeLocked" @click="downloadVersion(version)">导出稿</n-button>
                 </div>
                 <n-empty v-if="!state.frozen.length" description="冻结后生成只读制作稿" />
               </div>
@@ -409,6 +531,41 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
         <div class="dialog-actions">
           <n-button @click="showFreezeModal = false">取消</n-button>
           <n-button type="primary" @click="confirmFreeze">冻结并导出</n-button>
+        </div>
+      </div>
+    </n-modal>
+
+    <n-modal v-model:show="showImportModal">
+      <div class="dialog-card">
+        <span class="eyebrow">MERGE FIELD HANDOFF</span>
+        <h2>合并外采制作稿</h2>
+        <p>选择断网设备带回的交接包（.json）。外采稿只提供现场事实，场次编排以当前草稿为准；双方都动过的位置会留下两版，由导演选定。</p>
+        <input type="file" accept=".json,application/json" class="file-input" aria-label="选择交接包文件" @change="onPickFile" />
+        <n-alert v-if="importError" type="error" class="import-message" :show-icon="false">{{ importError }} 可修正后重新选择文件。</n-alert>
+        <n-alert v-else-if="importInfo" type="info" class="import-message" :show-icon="false">{{ importInfo }}</n-alert>
+        <div class="dialog-actions space-between">
+          <n-button quaternary size="small" @click="downloadDemoHandoff">下载演示交接包</n-button>
+          <n-button @click="showImportModal = false">关闭</n-button>
+        </div>
+      </div>
+    </n-modal>
+
+    <n-modal v-model:show="importSummaryModalVisible">
+      <div class="dialog-card">
+        <span class="eyebrow">MERGE RESULT</span>
+        <h2>合并完成 · 已重算</h2>
+        <div v-if="importSummary" class="merge-summary">
+          <div><span>来源</span><strong>{{ importSummary.source }}</strong></div>
+          <div><span>自动合入</span><strong>{{ importSummary.autoMerged }} 处</strong></div>
+          <div><span>新增 / 移除</span><strong>{{ importSummary.added }} / {{ importSummary.removed }} 条</strong></div>
+          <div><span>待确认记录</span><strong>+{{ importSummary.pendingImported }} 条</strong></div>
+          <div><span>冲突留两版</span><strong :class="{ dangerText: importSummary.conflicts > 0 }">{{ importSummary.conflicts }} 处</strong></div>
+          <div><span>重算总时长</span><strong>{{ importSummary.totalDuration.toFixed(1) }} 秒</strong></div>
+          <div><span>重算检查项</span><strong :class="{ dangerText: importSummary.warningCount > 0 }">{{ importSummary.warningCount }} 个</strong></div>
+        </div>
+        <p v-if="importSummary && importSummary.conflicts > 0">冲突位置已留下棚录 / 外采两版，导演选定前不能接受、冻结或导出。</p>
+        <div class="dialog-actions">
+          <n-button type="primary" @click="importSummaryModalVisible = false">{{ importSummary && importSummary.conflicts > 0 ? '去选定冲突' : '知道了' }}</n-button>
         </div>
       </div>
     </n-modal>

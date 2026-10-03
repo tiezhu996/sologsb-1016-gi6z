@@ -95,6 +95,26 @@ h3 { margin: 3px 0 0; font-size: 21px; }
 .dialog-card h2 { margin: 7px 0 12px; }
 .dialog-card p { color: #8895aa; font-size: 13px; line-height: 1.6; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.dialog-actions.space-between { justify-content: space-between; }
+.merge-lock { margin-bottom: 12px; }
+.merge-meta { display: flex; justify-content: space-between; gap: 10px; padding: 0 2px; color: #707d93; font-size: 11px; }
+.conflict-card { padding: 13px; border: 1px solid #4a3d2a; border-left: 3px solid #ffc777; border-radius: 10px; background: #141b28; }
+.conflict-card.resolved { border-color: #293346; border-left-color: #57c7a9; opacity: .82; }
+.conflict-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.conflict-title strong { font-size: 12px; }
+.conflict-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.conflict-side { display: grid; gap: 8px; align-content: start; padding: 10px; border: 1px solid #29334a; border-radius: 8px; background: #101725; }
+.conflict-side.remote { border-color: rgba(115, 218, 202, .35); }
+.conflict-side .side-label { color: #738097; font-size: 10px; font-weight: 800; letter-spacing: .08em; }
+.conflict-side p { margin: 0; color: #c4cfdf; font-size: 12px; line-height: 1.55; word-break: break-all; }
+.source-tag { margin-top: 8px; }
+.file-input { width: 100%; margin-top: 6px; padding: 12px; border: 1px dashed #33405a; border-radius: 9px; color: #9fb0c8; background: #101725; cursor: pointer; }
+.import-message { margin-top: 12px; }
+.merge-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 16px; margin: 6px 0 4px; }
+.merge-summary div { display: flex; justify-content: space-between; gap: 10px; padding: 7px 10px; border: 1px solid #263144; border-radius: 8px; background: #121826; }
+.merge-summary span { color: #78859d; font-size: 12px; }
+.merge-summary strong { color: #eef4ff; font-size: 12px; }
+.merge-summary .dangerText { color: #ff7a8a; }
 @media (max-width: 1180px) {
   .topbar { grid-template-columns: 190px 1fr; height: auto; }
   .top-actions { grid-column: 1 / -1; justify-content: flex-end; }

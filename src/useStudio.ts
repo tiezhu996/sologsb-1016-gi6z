@@ -1,6 +1,8 @@
 import { computed, ref, watch } from 'vue'
 import { sampleDocument } from './sample'
-import type { Cue, CueKind, FrozenVersion, PendingChange, Scene, StudioDocument, StudioState, WarningItem } from './types'
+import { parseHandoff } from './handoff'
+import { applyConflictResolution, mergeDocuments } from './merge'
+import type { Cue, CueKind, FrozenVersion, MergeSession, PendingChange, Scene, StudioDocument, StudioState, WarningItem } from './types'
 
 const STORAGE_KEY = 'sologsb-1016-studio-v1'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
@@ -11,7 +13,14 @@ function loadState(): StudioState {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as StudioState
-      if (parsed.document?.scenes?.length) return parsed
+      if (parsed.document?.scenes?.length) {
+        // 旧版本草稿没有合并相关字段，迁移时补齐
+        parsed.pending ??= []
+        parsed.frozen ??= []
+        parsed.merge ??= null
+        parsed.appliedImports ??= []
+        return parsed
+      }
     }
   } catch {
     // A corrupt local draft should not prevent access to the built-in example.
@@ -20,9 +29,27 @@ function loadState(): StudioState {
     document: clone(sampleDocument),
     pending: [],
     frozen: [],
+    merge: null,
+    appliedImports: [],
     updatedAt: new Date().toISOString()
   }
 }
+
+export interface MergeSummary {
+  source: string
+  autoMerged: number
+  added: number
+  removed: number
+  conflicts: number
+  pendingImported: number
+  /** 合并后重算的总时长与检查项数量 */
+  totalDuration: number
+  warningCount: number
+}
+
+export type ImportResult =
+  | { ok: true; summary: MergeSummary }
+  | { ok: false; reason: 'busy' | 'invalid' | 'duplicate' | 'no-change'; message: string }
 
 export function useStudio() {
   const state = ref<StudioState>(loadState())
@@ -52,6 +79,10 @@ export function useStudio() {
 
   const totalDuration = computed(() => state.value.document.scenes.reduce((total, scene) => total + durationOfScene(scene), 0))
   const pendingChanges = computed(() => state.value.pending.filter((item) => item.status === 'pending'))
+  const mergeSession = computed(() => state.value.merge)
+  const unresolvedConflicts = computed(() => state.value.merge?.conflicts.filter((item) => !item.resolution) ?? [])
+  /** 存在未选定的合并冲突时，接受、冻结、导出全部锁定 */
+  const mergeLocked = computed(() => unresolvedConflicts.value.length > 0)
 
   const warnings = computed<WarningItem[]>(() => {
     const result: WarningItem[] = []
@@ -116,7 +147,7 @@ export function useStudio() {
     }, 180)
   }
 
-  function commit(label: string, mutator: (document: StudioDocument) => void, note = '') {
+  function commit(label: string, mutator: (document: StudioDocument) => void, note = ''): string {
     const before = clone(state.value.document)
     const document = clone(state.value.document)
     mutator(document)
@@ -124,7 +155,7 @@ export function useStudio() {
     if (undoStack.value.length > 60) undoStack.value.shift()
     redoStack.value = []
     state.value.document = document
-    state.value.pending.unshift({
+    const change: PendingChange = {
       id: uid('change'),
       label,
       note,
@@ -132,9 +163,11 @@ export function useStudio() {
       status: 'pending',
       before,
       after: clone(document)
-    })
+    }
+    state.value.pending.unshift(change)
     if (state.value.pending.length > 80) state.value.pending = state.value.pending.slice(0, 80)
     persist()
+    return change.id
   }
 
   function replaceDocument(next: StudioDocument, label: string) {
@@ -259,6 +292,7 @@ export function useStudio() {
   }
 
   function acceptChange(changeId: string) {
+    if (mergeLocked.value) return // 冲突未选定前不能接受
     const change = state.value.pending.find((item) => item.id === changeId)
     if (!change || change.status !== 'pending') return
     change.status = 'accepted'
@@ -269,15 +303,28 @@ export function useStudio() {
     const index = state.value.pending.findIndex((item) => item.id === changeId && item.status === 'pending')
     if (index < 0) return
     const change = state.value.pending[index]
+    if (change.source) {
+      // 外采带回的记录只标记退回：它的 before 是外采设备上的文档，不能用来回滚本机草稿
+      change.status = 'rejected'
+      persist()
+      return
+    }
     undoStack.value.push(clone(state.value.document))
     state.value.document = clone(change.before)
+    const rejectedIds = new Set<string>()
     for (let i = 0; i <= index; i += 1) {
-      if (state.value.pending[i].status === 'pending') state.value.pending[i].status = 'rejected'
+      if (state.value.pending[i].status === 'pending') {
+        state.value.pending[i].status = 'rejected'
+        rejectedIds.add(state.value.pending[i].id)
+      }
     }
+    // 合并产生的记录被退回时，整个合并会话一并作废
+    if (state.value.merge?.changeId && rejectedIds.has(state.value.merge.changeId)) state.value.merge = null
     persist()
   }
 
   function acceptAll() {
+    if (mergeLocked.value) return // 冲突未选定前不能接受
     for (const change of state.value.pending) {
       if (change.status === 'pending') change.status = 'accepted'
     }
@@ -298,7 +345,8 @@ export function useStudio() {
     replaceDocument(next, '重做修改')
   }
 
-  function freeze(name: string): FrozenVersion {
+  function freeze(name: string): FrozenVersion | null {
+    if (mergeLocked.value) return null // 冲突未选定前不能冻结
     const version: FrozenVersion = {
       id: uid('version'),
       name: name.trim() || `制作稿 v${state.value.frozen.length + 1}`,
@@ -345,6 +393,7 @@ export function useStudio() {
   }
 
   function downloadVersion(version: FrozenVersion) {
+    if (mergeLocked.value) return // 冲突未选定前不能导出
     const blob = new Blob([makeScript(version.document)], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
@@ -362,7 +411,108 @@ export function useStudio() {
     selectedSceneId.value = state.value.document.scenes[0]?.id ?? ''
   }
 
-  watch(state, persist, { deep: true })
+  /**
+   * 导入断网回来的外采交接包并合并进当前草稿。
+   * 校验全部通过前不触碰任何状态，失败可直接重试；
+   * 同一 importId 重复送达时直接忽略，不多出任何记录。
+   * 冻结版本只读，合并不触碰 state.frozen。
+   */
+  function importHandoff(raw: string): ImportResult {
+    const parsed = parseHandoff(raw)
+    if (!parsed.ok) return { ok: false, reason: 'invalid', message: parsed.error }
+    const pkg = parsed.pkg
+    // 同一包重复送达：无论当前状态如何都直接忽略，不多出任何记录
+    if (state.value.appliedImports.includes(pkg.importId)) {
+      return { ok: false, reason: 'duplicate', message: '该交接包已合并过，重复送达未产生新记录。' }
+    }
+    if (state.value.merge) {
+      return { ok: false, reason: 'busy', message: '上一批合并冲突尚未选定，请先完成或放弃当前合并。' }
+    }
+
+    const result = mergeDocuments(pkg.baseline, state.value.document, pkg.document)
+    // 待确认记录按 id 对位去重，只补充本机没有的条目
+    const knownIds = new Set(state.value.pending.map((item) => item.id))
+    const freshPending = pkg.pending
+      .filter((item) => !knownIds.has(item.id))
+      .map((item) => ({ ...clone(item), source: item.source ?? pkg.source }))
+
+    if (!result.changed && !result.conflicts.length && !freshPending.length) {
+      return { ok: false, reason: 'no-change', message: '外采稿与当前草稿一致，没有需要合并的内容。' }
+    }
+
+    let changeId: string | undefined
+    if (result.changed) {
+      const statsNote = `自动合入 ${result.stats.autoMerged} 处 · 新增 ${result.stats.added} 条 · 移除 ${result.stats.removed} 条 · 冲突 ${result.conflicts.length} 处`
+      changeId = commit(`合并外采制作稿（${pkg.source}）`, (document) => {
+        Object.assign(document, clone(result.document))
+      }, statsNote)
+      // 合并有改动就重算场次时长与检查结果，并写进记录备注
+      const change = state.value.pending.find((item) => item.id === changeId)
+      if (change) change.note = `${statsNote}；合并后重算：总时长 ${totalDuration.value.toFixed(1)} 秒，检查项 ${warnings.value.length} 个`
+      // 合并可能删掉了当前选中的场次，回退到第一场
+      if (!state.value.document.scenes.some((scene) => scene.id === selectedSceneId.value)) {
+        selectedSceneId.value = state.value.document.scenes[0]?.id ?? ''
+      }
+    }
+    if (freshPending.length) {
+      state.value.pending.push(...freshPending)
+      if (state.value.pending.length > 80) state.value.pending = state.value.pending.slice(0, 80)
+    }
+    if (result.conflicts.length) {
+      const session: MergeSession = {
+        importId: pkg.importId,
+        source: pkg.source,
+        startedAt: new Date().toISOString(),
+        changeId,
+        conflicts: result.conflicts
+      }
+      state.value.merge = session
+    }
+    state.value.appliedImports.push(pkg.importId)
+    persist()
+    return {
+      ok: true,
+      summary: {
+        source: pkg.source,
+        autoMerged: result.stats.autoMerged,
+        added: result.stats.added,
+        removed: result.stats.removed,
+        conflicts: result.conflicts.length,
+        pendingImported: freshPending.length,
+        totalDuration: totalDuration.value,
+        warningCount: warnings.value.length
+      }
+    }
+  }
+
+  /** 导演选定冲突的其中一版，写回当前草稿并留下确认记录 */
+  function resolveConflict(conflictId: string, choice: 'local' | 'remote') {
+    const session = state.value.merge
+    const conflict = session?.conflicts.find((item) => item.id === conflictId)
+    if (!session || !conflict || conflict.resolution) return
+    commit(`合并冲突选定：${conflict.label} → ${choice === 'remote' ? '外采版' : '棚录版'}`, (document) => {
+      applyConflictResolution(document, conflict, choice)
+    })
+    conflict.resolution = choice
+    // 全部选定后会话结束，接受 / 冻结 / 导出恢复可用
+    if (session.conflicts.every((item) => item.resolution)) state.value.merge = null
+    persist()
+  }
+
+  /** 放弃合并会话：草稿保留当前内容（冲突位置暂留的棚录版），两版记录作废 */
+  function abandonMerge() {
+    if (!state.value.merge) return
+    state.value.merge = null
+    persist()
+  }
+
+  // 只监听内容字段：persist 自身会更新 updatedAt，若把整个 state 作为监听源，
+  // 连续高频修改（如合并导入）会跨毫秒自触发，导致递归更新
+  watch(
+    () => [state.value.document, state.value.pending, state.value.frozen, state.value.merge, state.value.appliedImports],
+    () => persist(),
+    { deep: true }
+  )
 
   return {
     state,
@@ -373,6 +523,9 @@ export function useStudio() {
     pendingChanges,
     warnings,
     saveState,
+    mergeSession,
+    unresolvedConflicts,
+    mergeLocked,
     durationOfCue,
     durationOfScene,
     updateProject,
@@ -393,6 +546,9 @@ export function useStudio() {
     downloadVersion,
     makeScript,
     resetSample,
+    importHandoff,
+    resolveConflict,
+    abandonMerge,
     persist
   }
 }
